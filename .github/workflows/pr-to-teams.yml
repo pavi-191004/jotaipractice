@@ -19,19 +19,84 @@ env:
   TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
 
 jobs:
-  # Opened / review requested / approved / changes requested / merged
-  pr-status:
-    if: github.event_name != 'push' && github.event.action != 'synchronize' && !github.event.pull_request.draft
+  teams:
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.repository.default_branch }}
+      # ---------- Helper that builds and sends the Teams card ----------
+      - name: Create Teams notify helper
+        run: |
+          cat > /tmp/teams-notify.sh <<'EOF'
+          #!/usr/bin/env bash
+          # Usage: teams-notify.sh <pr_number> "<status text>" <color> [actor_login]
+          set -euo pipefail
+          PR_NUMBER="$1"; STATUS="$2"; COLOR="${3:-Default}"; ACTOR="${4:-}"
+          REPO="$GH_REPO"
 
-      - name: Show scripts folder (for debugging)
-        run: ls -la .github/scripts || echo "❌ .github/scripts folder not found on the default branch"
+          display_name() {
+            local n
+            n=$(gh api "users/$1" --jq '.name // empty' 2>/dev/null || true)
+            echo "${n:-$1}"
+          }
 
-      - name: Post status to Teams
+          pr=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
+          title=$(jq -r '.title' <<<"$pr")
+          url=$(jq -r '.html_url' <<<"$pr")
+          author_login=$(jq -r '.user.login' <<<"$pr")
+          branch="$(jq -r '.head.ref' <<<"$pr") → $(jq -r '.base.ref' <<<"$pr")"
+
+          reviewer_logins=$( {
+            jq -r '.requested_reviewers[].login' <<<"$pr"
+            gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --jq '.[].user.login'
+          } | sort -u | grep -vx "$author_login" || true )
+
+          reviewers=""
+          for login in $reviewer_logins; do reviewers+="$(display_name "$login"), "; done
+          reviewers="${reviewers%, }"
+          [ -z "$reviewers" ] && reviewers="Not assigned yet"
+
+          status_line="$STATUS"
+          [ -n "$ACTOR" ] && status_line+=" by $(display_name "$ACTOR")"
+
+          payload=$(jq -n \
+            --arg status "$status_line" --arg color "$COLOR" \
+            --arg title "$title" --arg url "$url" \
+            --arg reviewers "$reviewers" \
+            --arg author "$(display_name "$author_login")" \
+            --arg branch "$branch" \
+            '{
+              type: "message",
+              attachments: [{
+                contentType: "application/vnd.microsoft.card.adaptive",
+                contentUrl: null,
+                content: {
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  type: "AdaptiveCard",
+                  version: "1.4",
+                  msteams: { width: "Full" },
+                  body: [
+                    { type: "TextBlock", text: $status, color: $color, weight: "Bolder", size: "Medium", wrap: true },
+                    { type: "TextBlock", text: $title, weight: "Bolder", wrap: true, spacing: "Medium" },
+                    { type: "TextBlock", text: ("[" + $url + "](" + $url + ")"), wrap: true, spacing: "None" },
+                    { type: "FactSet", facts: [
+                      { title: "Reviewer", value: $reviewers },
+                      { title: "Author",   value: $author },
+                      { title: "Branch",   value: $branch }
+                    ]}
+                  ],
+                  actions: [ { type: "Action.OpenUrl", title: "Open PR", url: $url } ]
+                }
+              }]
+            }')
+
+          curl -sS -f -X POST -H "Content-Type: application/json" -d "$payload" "$TEAMS_WEBHOOK_URL"
+          echo "Posted to Teams: $status_line — PR #$PR_NUMBER"
+          EOF
+          chmod +x /tmp/teams-notify.sh
+
+      # ---------- Opened / review requested / approved / changes requested / merged ----------
+      - name: Post PR status to Teams
+        if: github.event_name != 'push' && github.event.action != 'synchronize'
         env:
           EVENT: ${{ github.event_name }}
           ACTION: ${{ github.event.action }}
@@ -48,8 +113,7 @@ jobs:
               status="🆕 New PR raised"; color="Accent" ;;
 
             pull_request_target:review_requested)
-              # If the reviewer was picked while creating the PR, the "New PR" card
-              # already shows them, so skip to avoid a duplicate message.
+              # Skip if reviewer was picked while creating the PR (the "New PR" card shows them)
               age=$(( $(date +%s) - $(date -d "$CREATED_AT" +%s) ))
               if [ "$age" -gt 120 ]; then status="👀 Review requested"; color="Accent"; fi ;;
 
@@ -65,24 +129,47 @@ jobs:
           esac
 
           if [ -n "$status" ]; then
-            bash .github/scripts/teams-notify.sh "$PR" "$status" "$color" "$actor"
+            /tmp/teams-notify.sh "$PR" "$status" "$color" "$actor"
           else
             echo "Nothing to post for $EVENT/$ACTION"
           fi
 
-  # Conflict detection: runs when the target branch moves, or a PR gets new commits
-  conflict-check:
-    if: github.event_name == 'push' || (github.event.action == 'synchronize' && !github.event.pull_request.draft)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-
-      - name: Show scripts folder (for debugging)
-        run: ls -la .github/scripts || echo "❌ .github/scripts folder not found on the default branch"
-
+      # ---------- Merge conflict detection ----------
       - name: Check open PRs for merge conflicts
+        if: github.event_name == 'push' || github.event.action == 'synchronize'
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: bash .github/scripts/check-conflicts.sh
+        run: |
+          LABEL="has-conflict"
+          gh label create "$LABEL" --color D93F0B --description "PR has merge conflicts" --force >/dev/null
+
+          if [ -n "${PR_NUMBER:-}" ]; then
+            prs="$PR_NUMBER"
+          else
+            prs=$(gh pr list --state open --limit 100 --json number,isDraft \
+                  --jq '.[] | select(.isDraft | not) | .number')
+          fi
+
+          sleep 15   # GitHub computes mergeability in the background
+
+          for n in $prs; do
+            state="unknown"
+            for _ in 1 2 3 4 5 6; do
+              state=$(gh api "repos/$GH_REPO/pulls/$n" --jq '.mergeable_state')
+              [ "$state" != "unknown" ] && break
+              sleep 5
+            done
+
+            has_label=$(gh pr view "$n" --json labels \
+                        --jq "[.labels[].name] | index(\"$LABEL\") != null")
+
+            if [ "$state" = "dirty" ] && [ "$has_label" = "false" ]; then
+              gh pr edit "$n" --add-label "$LABEL"
+              /tmp/teams-notify.sh "$n" "⚠️ Merge conflict — please resolve" Attention
+            elif [ "$state" != "dirty" ] && [ "$state" != "unknown" ] && [ "$has_label" = "true" ]; then
+              gh pr edit "$n" --remove-label "$LABEL"
+              /tmp/teams-notify.sh "$n" "🔧 Conflict resolved" Good
+            else
+              echo "PR #$n: $state (no change)"
+            fi
+          done
