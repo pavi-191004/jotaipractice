@@ -17,6 +17,7 @@ env:
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GH_REPO: ${{ github.repository }}
   TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+  TEAMS_EMAIL_DOMAIN: noukha.in   # "Tag: hari" becomes hari@noukha.in
 
 jobs:
   teams:
@@ -32,6 +33,7 @@ jobs:
           set -euo pipefail
           PR_NUMBER="$1"; STATUS="$2"; COLOR="${3:-Default}"; ACTOR="${4:-}"
           REPO="$GH_REPO"
+          DOMAIN="${TEAMS_EMAIL_DOMAIN:-noukha.in}"
 
           display_name() {
             local n
@@ -45,15 +47,24 @@ jobs:
           author_login=$(jq -r '.user.login' <<<"$pr")
           branch="$(jq -r '.head.ref' <<<"$pr") → $(jq -r '.base.ref' <<<"$pr")"
 
-          reviewer_logins=$( {
-            jq -r '.requested_reviewers[].login' <<<"$pr"
-            gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --jq '.[].user.login'
-          } | sort -u | grep -vx "$author_login" || true )
+          # ---- Who to @mention: read the "Tag:" line from the PR description ----
+          # e.g.  Tag: hari, phil      ->  hari@noukha.in, phil@noukha.in
+          #       Tag: gopi@noukha.in  ->  used as-is
+          body=$(jq -r '.body // ""' <<<"$pr" | tr -d '\r')
+          tag_line=$(grep -iE '^[[:space:]]*(tag|tags)[[:space:]]*:' <<<"$body" | head -1 | cut -d: -f2- || true)
 
-          reviewers=""
-          for login in $reviewer_logins; do reviewers+="$(display_name "$login"), "; done
-          reviewers="${reviewers%, }"
-          [ -z "$reviewers" ] && reviewers="Not assigned yet"
+          mentions='[]'
+          for tok in $(tr ',;' '  ' <<<"$tag_line"); do
+            tok="${tok#@}"
+            [ -z "$tok" ] && continue
+            if [[ "$tok" == *@* ]]; then email="${tok,,}"; else email="${tok,,}@${DOMAIN}"; fi
+            local_part="${email%%@*}"
+            name="${local_part^}"
+            mentions=$(jq -c --arg e "$email" --arg n "$name" \
+              '. + [{type:"mention", text:("<at>"+$n+"</at>"), mentioned:{id:$e, name:$n}}]' <<<"$mentions")
+          done
+          tagged_text=$(jq -r 'map(.text) | join(" ")' <<<"$mentions")
+          [ -z "$tagged_text" ] && tagged_text="No one tagged"
 
           status_line="$STATUS"
           [ -n "$ACTOR" ] && status_line+=" by $(display_name "$ACTOR")"
@@ -61,9 +72,10 @@ jobs:
           payload=$(jq -n \
             --arg status "$status_line" --arg color "$COLOR" \
             --arg title "$title" --arg url "$url" \
-            --arg reviewers "$reviewers" \
+            --arg tagged "Tagged: $tagged_text" \
             --arg author "$(display_name "$author_login")" \
             --arg branch "$branch" \
+            --argjson mentions "$mentions" \
             '{
               type: "message",
               attachments: [{
@@ -73,15 +85,15 @@ jobs:
                   "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
                   type: "AdaptiveCard",
                   version: "1.4",
-                  msteams: { width: "Full" },
+                  msteams: { width: "Full", entities: $mentions },
                   body: [
                     { type: "TextBlock", text: $status, color: $color, weight: "Bolder", size: "Medium", wrap: true },
                     { type: "TextBlock", text: $title, weight: "Bolder", wrap: true, spacing: "Medium" },
                     { type: "TextBlock", text: ("[" + $url + "](" + $url + ")"), wrap: true, spacing: "None" },
+                    { type: "TextBlock", text: $tagged, wrap: true, spacing: "Medium" },
                     { type: "FactSet", facts: [
-                      { title: "Reviewer", value: $reviewers },
-                      { title: "Author",   value: $author },
-                      { title: "Branch",   value: $branch }
+                      { title: "Author", value: $author },
+                      { title: "Branch", value: $branch }
                     ]}
                   ],
                   actions: [ { type: "Action.OpenUrl", title: "Open PR", url: $url } ]
@@ -90,7 +102,7 @@ jobs:
             }')
 
           curl -sS -f -X POST -H "Content-Type: application/json" -d "$payload" "$TEAMS_WEBHOOK_URL"
-          echo "Posted to Teams: $status_line — PR #$PR_NUMBER"
+          echo "Posted to Teams: $status_line — PR #$PR_NUMBER — $tagged_text"
           EOF
           chmod +x /tmp/teams-notify.sh
 
