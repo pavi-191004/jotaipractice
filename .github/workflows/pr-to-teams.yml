@@ -1,187 +1,126 @@
-name: PR updates to Teams
+# Posts a Microsoft Teams card when a PR targets a watched branch. Self-contained: no other repo needed.
+# Repo secrets: TEAMS_WEBHOOK_FRONTEND or TEAMS_WEBHOOK_BACKEND. Repo variable: TEAMS_USER_MAP
+#   {"<github-login>":{"name":"<Teams name>","email":"<Teams email>"}}
+name: PR notify
 
 on:
-  pull_request_target:
-    types: [opened, reopened, ready_for_review, review_requested, closed, synchronize]
-  pull_request_review:
-    types: [submitted]
-  push:
-    branches: [main, develop, pavithra]   # the branches your PRs merge into
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+    branches: [main]   # edit: branches whose PRs notify Teams
 
-permissions:
-  contents: read
-  pull-requests: write   # to add/remove the "has-conflict" label
-  issues: write          # labels live on the issues API
+permissions: {}   # this job needs no access to the repo
 
 env:
-  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  GH_REPO: ${{ github.repository }}
-  TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
-  TEAMS_EMAIL_DOMAIN: noukha.in   # "Tag: hari" becomes hari@noukha.in
+  # ---- edit per project ----
+  PROJECT: jotaipractice
+  TEAMS_CHAT: FRONTEND   # FRONTEND (mobile app, admin panel) or BACKEND
+  DEFAULT_MENTIONS: '["pavi-191004"]'   # GitHub logins always tagged
 
 jobs:
-  teams:
-    if: ${{ !github.event.pull_request.draft }}
+  notify:
     runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
     steps:
-      # ---------- Helper that builds and sends the Teams card ----------
-      - name: Create Teams notify helper
+      - name: Send Teams card
+        env:
+          WEBHOOK: ${{ secrets[format('TEAMS_WEBHOOK_{0}', env.TEAMS_CHAT)] }}
+          # Passed via env, never inlined in the script: PR titles are untrusted input.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          REVIEWERS: ${{ toJSON(github.event.pull_request.requested_reviewers.*.login) }}
+          USER_MAP: ${{ vars.TEAMS_USER_MAP || '{}' }}
         run: |
-          cat > /tmp/teams-notify.sh <<'EOF'
-          #!/usr/bin/env bash
-          # Usage: teams-notify.sh <pr_number> "<status text>" <color> [actor_login]
-          set -euo pipefail
-          PR_NUMBER="$1"; STATUS="$2"; COLOR="${3:-Default}"; ACTOR="${4:-}"
-          REPO="$GH_REPO"
-          DOMAIN="${TEAMS_EMAIL_DOMAIN:-noukha.in}"
+          python3 - <<'PY'
+          import json, os, sys, urllib.request, urllib.error
 
-          display_name() {
-            local n
-            n=$(gh api "users/$1" --jq '.name // empty' 2>/dev/null || true)
-            echo "${n:-$1}"
+          def load(name, default):
+              try:
+                  value = json.loads(os.environ.get(name) or "")
+                  return value if isinstance(value, type(default)) else default
+              except ValueError:
+                  return default
+
+          webhook = os.environ.get("WEBHOOK", "")
+          if not webhook:
+              print(f"::error::Secret TEAMS_WEBHOOK_{os.environ['TEAMS_CHAT']} is not set.")
+              sys.exit(1)
+
+          user_map = load("USER_MAP", {})
+          reviewers = [r for r in load("REVIEWERS", []) if isinstance(r, str)]
+          defaults = [d for d in load("DEFAULT_MENTIONS", []) if isinstance(d, str)]
+          author = os.environ["PR_AUTHOR"]
+
+          entities, seen = [], set()
+
+          def tag(login):
+              info = user_map.get(login)
+              if isinstance(info, dict) and info.get("name") and info.get("email"):
+                  text = f"<at>{info['name']}</at>"
+                  if login not in seen:
+                      seen.add(login)
+                      entities.append({
+                          "type": "mention",
+                          "text": text,
+                          "mentioned": {"id": info["email"], "name": info["name"]},
+                      })
+                  return text
+              return f"@{login}"
+
+          # Keep untrusted text from faking a Teams mention.
+          title = os.environ["PR_TITLE"].replace("<at>", "").replace("</at>", "")
+
+          facts = [
+              {"title": "Author", "value": tag(author)},
+              {"title": "Branch", "value": f"{os.environ['PR_HEAD']} → {os.environ['PR_BASE']}"},
+              {"title": "Reviewers", "value": ", ".join(tag(r) for r in reviewers) or "None requested"},
+          ]
+
+          body = [
+              {"type": "TextBlock", "text": f"New pull request in {os.environ['PROJECT']}",
+               "weight": "Bolder", "size": "Medium", "wrap": True},
+              {"type": "TextBlock", "text": f"#{os.environ['PR_NUM']} {title}", "wrap": True},
+              {"type": "FactSet", "facts": facts},
+          ]
+
+          fyi = [tag(d) for d in defaults if d != author]
+          if fyi:
+              body.append({"type": "TextBlock", "text": "FYI: " + ", ".join(fyi), "wrap": True})
+
+          card = {
+              "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+              "type": "AdaptiveCard",
+              "version": "1.4",
+              "body": body,
+              "actions": [{"type": "Action.OpenUrl", "title": "Open PR", "url": os.environ["PR_URL"]}],
+              "msteams": {"width": "Full", "entities": entities},
           }
 
-          pr=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
-          title=$(jq -r '.title' <<<"$pr")
-          url=$(jq -r '.html_url' <<<"$pr")
-          author_login=$(jq -r '.user.login' <<<"$pr")
-          branch="$(jq -r '.head.ref' <<<"$pr") → $(jq -r '.base.ref' <<<"$pr")"
+          payload = {
+              "type": "message",
+              "attachments": [{
+                  "contentType": "application/vnd.microsoft.card.adaptive",
+                  "contentUrl": None,
+                  "content": card,
+              }],
+          }
 
-          # ---- Who to @mention: read the "Tag:" line from the PR description ----
-          # e.g.  Tag: hari, phil      ->  hari@noukha.in, phil@noukha.in
-          #       Tag: gopi@noukha.in  ->  used as-is
-          body=$(jq -r '.body // ""' <<<"$pr" | tr -d '\r')
-          tag_line=$(grep -iE '^[[:space:]]*(tag|tags)[[:space:]]*:' <<<"$body" | head -1 | cut -d: -f2- || true)
-
-          mentions='[]'
-          for tok in $(tr ',;' '  ' <<<"$tag_line"); do
-            tok="${tok#@}"
-            [ -z "$tok" ] && continue
-            if [[ "$tok" == *@* ]]; then email="${tok,,}"; else email="${tok,,}@${DOMAIN}"; fi
-            local_part="${email%%@*}"
-            name="${local_part^}"
-            mentions=$(jq -c --arg e "$email" --arg n "$name" \
-              '. + [{type:"mention", text:("<at>"+$n+"</at>"), mentioned:{id:$e, name:$n}}]' <<<"$mentions")
-          done
-          tagged_text=$(jq -r 'map(.text) | join(" ")' <<<"$mentions")
-          [ -z "$tagged_text" ] && tagged_text="No one tagged"
-
-          status_line="$STATUS"
-          [ -n "$ACTOR" ] && status_line+=" by $(display_name "$ACTOR")"
-
-          payload=$(jq -n \
-            --arg status "$status_line" --arg color "$COLOR" \
-            --arg title "$title" --arg url "$url" \
-            --arg tagged "Tagged: $tagged_text" \
-            --arg author "$(display_name "$author_login")" \
-            --arg branch "$branch" \
-            --argjson mentions "$mentions" \
-            '{
-              type: "message",
-              attachments: [{
-                contentType: "application/vnd.microsoft.card.adaptive",
-                contentUrl: null,
-                content: {
-                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                  type: "AdaptiveCard",
-                  version: "1.4",
-                  msteams: { width: "Full", entities: $mentions },
-                  body: [
-                    { type: "TextBlock", text: $status, color: $color, weight: "Bolder", size: "Medium", wrap: true },
-                    { type: "TextBlock", text: $title, weight: "Bolder", wrap: true, spacing: "Medium" },
-                    { type: "TextBlock", text: ("[" + $url + "](" + $url + ")"), wrap: true, spacing: "None" },
-                    { type: "TextBlock", text: $tagged, wrap: true, spacing: "Medium" },
-                    { type: "FactSet", facts: [
-                      { title: "Author", value: $author },
-                      { title: "Branch", value: $branch }
-                    ]}
-                  ],
-                  actions: [ { type: "Action.OpenUrl", title: "Open PR", url: $url } ]
-                }
-              }]
-            }')
-
-          curl -sS -f -X POST -H "Content-Type: application/json" -d "$payload" "$TEAMS_WEBHOOK_URL"
-          echo "Posted to Teams: $status_line — PR #$PR_NUMBER — $tagged_text"
-          EOF
-          chmod +x /tmp/teams-notify.sh
-
-      # ---------- Opened / review requested / approved / changes requested / merged ----------
-      - name: Post PR status to Teams
-        if: github.event_name != 'push' && github.event.action != 'synchronize'
-        env:
-          EVENT: ${{ github.event_name }}
-          ACTION: ${{ github.event.action }}
-          MERGED: ${{ github.event.pull_request.merged }}
-          REVIEW_STATE: ${{ github.event.review.state }}
-          SENDER: ${{ github.event.sender.login }}
-          CREATED_AT: ${{ github.event.pull_request.created_at }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          status=""; color="Default"; actor="$SENDER"
-
-          case "$EVENT:$ACTION" in
-            pull_request_target:opened|pull_request_target:reopened|pull_request_target:ready_for_review)
-              status="🆕 New PR raised"; color="Accent" ;;
-
-            pull_request_target:review_requested)
-              # Skip if reviewer was picked while creating the PR (the "New PR" card shows them)
-              age=$(( $(date +%s) - $(date -d "$CREATED_AT" +%s) ))
-              if [ "$age" -gt 120 ]; then status="👀 Review requested"; color="Accent"; fi ;;
-
-            pull_request_target:closed)
-              # Only announce merges; PRs closed without merging are ignored
-              if [ "$MERGED" = "true" ]; then status="✅ Merged"; color="Good"; fi ;;
-
-            pull_request_review:submitted)
-              case "$REVIEW_STATE" in
-                approved)          status="👍 Approved";          color="Good" ;;
-                changes_requested) status="✏️ Changes requested"; color="Warning" ;;
-              esac ;;
-          esac
-
-          if [ -n "$status" ]; then
-            /tmp/teams-notify.sh "$PR" "$status" "$color" "$actor"
-          else
-            echo "Nothing to post for $EVENT/$ACTION"
-          fi
-
-      # ---------- Merge conflict detection ----------
-      - name: Check open PRs for merge conflicts
-        if: github.event_name == 'push' || github.event.action == 'synchronize'
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          LABEL="has-conflict"
-          gh label create "$LABEL" --color D93F0B --description "PR has merge conflicts" --force >/dev/null
-
-          if [ -n "${PR_NUMBER:-}" ]; then
-            prs="$PR_NUMBER"
-          else
-            prs=$(gh pr list --state open --limit 100 --json number,isDraft \
-                  --jq '.[] | select(.isDraft | not) | .number')
-          fi
-
-          sleep 15   # GitHub computes mergeability in the background
-
-          for n in $prs; do
-            state="unknown"
-            for _ in 1 2 3 4 5 6; do
-              state=$(gh api "repos/$GH_REPO/pulls/$n" --jq '.mergeable_state')
-              [ "$state" != "unknown" ] && break
-              sleep 5
-            done
-
-            has_label=$(gh pr view "$n" --json labels \
-                        --jq "[.labels[].name] | index(\"$LABEL\") != null")
-
-            if [ "$state" = "dirty" ] && [ "$has_label" = "false" ]; then
-              gh pr edit "$n" --add-label "$LABEL"
-              /tmp/teams-notify.sh "$n" "⚠️ Merge conflict — please resolve" Attention
-            elif [ "$state" != "dirty" ] && [ "$state" != "unknown" ] && [ "$has_label" = "true" ]; then
-              gh pr edit "$n" --remove-label "$LABEL"
-              /tmp/teams-notify.sh "$n" "🔧 Conflict resolved" Good
-            else
-              echo "PR #$n: $state (no change)"
-            fi
-          done
+          req = urllib.request.Request(
+              webhook,
+              data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  print(f"Teams responded {resp.status}")
+          except urllib.error.HTTPError as e:
+              print(f"::error::Teams webhook returned {e.code}: {e.read().decode(errors='replace')[:500]}")
+              sys.exit(1)
+          except urllib.error.URLError as e:
+              print(f"::error::Could not reach Teams webhook: {e.reason}")
+              sys.exit(1)
+          PY
