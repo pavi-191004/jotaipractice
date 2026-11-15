@@ -1,20 +1,24 @@
-# Posts a Microsoft Teams card when a PR targets a watched branch. Self-contained: no other repo needed.
-# Repo secrets: TEAMS_WEBHOOK_FRONTEND or TEAMS_WEBHOOK_BACKEND. Repo variable: TEAMS_USER_MAP
-#   {"<github-login>":{"name":"<Teams name>","email":"<Teams email>"}}
+# PR notify: posts a Microsoft Teams card when a PR targets develop, and updates the
+# same card to Merged / Closed. Copy this file to .github/workflows/pr-notify.yml in your repo
+# and edit ONLY the env block below.
+#
+# Repo settings (Settings > Secrets and variables > Actions):
+#   Secret   TEAMS_WEBHOOK_FRONTEND = <recently shared FRONTEND flow URL> (mobile app, admin panel)
+#   Secret   TEAMS_WEBHOOK_BACKEND  = <recently shared BACKEND flow URL>  (backend services)
+#   Variable TEAMS_USER_MAP         = existing team list (same value as in the other repos)
+# Never commit the flow URLs.
 name: PR notify
 
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review]
-    branches: [main]   # edit: branches whose PRs notify Teams
-
-permissions: {}   # this job needs no access to the repo
+    types: [opened, reopened, ready_for_review, closed]
+    branches: [develop]   # edit: branches whose PRs notify Teams
 
 env:
   # ---- edit per project ----
-  PROJECT: jotaipractice
+  PROJECT: <repo-name>   # shown on the card
   TEAMS_CHAT: FRONTEND   # FRONTEND (mobile app, admin panel) or BACKEND
-  DEFAULT_MENTIONS: '["pavi-191004"]'   # GitHub logins always tagged
+  DEFAULT_MENTIONS: '["<github-login>"]'   # GitHub logins always tagged
 
 jobs:
   notify:
@@ -31,96 +35,52 @@ jobs:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_HEAD: ${{ github.event.pull_request.head.ref }}
           PR_BASE: ${{ github.event.pull_request.base.ref }}
+          PR_ACTION: ${{ github.event.action }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          REPO: ${{ github.repository }}
           REVIEWERS: ${{ toJSON(github.event.pull_request.requested_reviewers.*.login) }}
           USER_MAP: ${{ vars.TEAMS_USER_MAP || '{}' }}
         run: |
-          python3 - <<'PY'
-          import json, os, sys, urllib.request, urllib.error
-
-          def load(name, default):
-              try:
-                  value = json.loads(os.environ.get(name) or "")
-                  return value if isinstance(value, type(default)) else default
-              except ValueError:
-                  return default
-
-          webhook = os.environ.get("WEBHOOK", "")
-          if not webhook:
-              print(f"::error::Secret TEAMS_WEBHOOK_{os.environ['TEAMS_CHAT']} is not set.")
-              sys.exit(1)
-
-          user_map = load("USER_MAP", {})
-          reviewers = [r for r in load("REVIEWERS", []) if isinstance(r, str)]
-          defaults = [d for d in load("DEFAULT_MENTIONS", []) if isinstance(d, str)]
-          author = os.environ["PR_AUTHOR"]
-
-          entities, seen = [], set()
-
-          def tag(login):
-              info = user_map.get(login)
-              if isinstance(info, dict) and info.get("name") and info.get("email"):
-                  text = f"<at>{info['name']}</at>"
-                  if login not in seen:
-                      seen.add(login)
-                      entities.append({
-                          "type": "mention",
-                          "text": text,
-                          "mentioned": {"id": info["email"], "name": info["name"]},
-                      })
-                  return text
-              return f"@{login}"
-
-          # Keep untrusted text from faking a Teams mention.
-          title = os.environ["PR_TITLE"].replace("<at>", "").replace("</at>", "")
-
-          facts = [
-              {"title": "Author", "value": tag(author)},
-              {"title": "Branch", "value": f"{os.environ['PR_HEAD']} → {os.environ['PR_BASE']}"},
-              {"title": "Reviewers", "value": ", ".join(tag(r) for r in reviewers) or "None requested"},
-          ]
-
-          body = [
-              {"type": "TextBlock", "text": f"New pull request in {os.environ['PROJECT']}",
-               "weight": "Bolder", "size": "Medium", "wrap": True},
-              {"type": "TextBlock", "text": f"#{os.environ['PR_NUM']} {title}", "wrap": True},
-              {"type": "FactSet", "facts": facts},
-          ]
-
-          fyi = [tag(d) for d in defaults if d != author]
-          if fyi:
-              body.append({"type": "TextBlock", "text": "FYI: " + ", ".join(fyi), "wrap": True})
-
-          card = {
-              "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-              "type": "AdaptiveCard",
-              "version": "1.4",
-              "body": body,
-              "actions": [{"type": "Action.OpenUrl", "title": "Open PR", "url": os.environ["PR_URL"]}],
-              "msteams": {"width": "Full", "entities": entities},
-          }
-
-          payload = {
-              "type": "message",
-              "attachments": [{
-                  "contentType": "application/vnd.microsoft.card.adaptive",
-                  "contentUrl": None,
-                  "content": card,
-              }],
-          }
-
-          req = urllib.request.Request(
-              webhook,
-              data=json.dumps(payload).encode(),
-              headers={"Content-Type": "application/json"},
-              method="POST",
-          )
-          try:
-              with urllib.request.urlopen(req, timeout=30) as resp:
-                  print(f"Teams responded {resp.status}")
-          except urllib.error.HTTPError as e:
-              print(f"::error::Teams webhook returned {e.code}: {e.read().decode(errors='replace')[:500]}")
-              sys.exit(1)
-          except urllib.error.URLError as e:
-              print(f"::error::Could not reach Teams webhook: {e.reason}")
-              sys.exit(1)
-          PY
+          # Open / Merged / Closed: must match the PR_Card_Map Status choices
+          status=Open
+          [ "$PR_ACTION" = closed ] && { [ "$PR_MERGED" = true ] && status=Merged || status=Closed; }
+          payload=$(jq -n \
+            --arg status "$status" --arg repo "$REPO" \
+            --arg project "$PROJECT" --arg title "$PR_TITLE" --arg author "$PR_AUTHOR" --arg url "$PR_URL" --arg num "$PR_NUM" --arg head "$PR_HEAD" --arg base "$PR_BASE" \
+            --argjson map "$USER_MAP" --argjson rev "$REVIEWERS" --argjson def "$DEFAULT_MENTIONS" '
+            # author mentioned too when in the map; reviewers = requested + defaults, mapped only
+            ($map[$author] // null) as $me |
+            (if $me then "<at>\($me.name)</at>" else $author end) as $who |
+            ([$rev[], $def[]] | unique | map(select(. != $author and $map[.] != null)) | map($map[.])) as $tags |
+            def row($label; $value; $bold): {type:"ColumnSet", spacing:"Small", columns:[
+              {type:"Column", width:"90px", items:[{type:"TextBlock", text:$label, isSubtle:true, wrap:true}]},
+              {type:"Column", width:"stretch", items:[{type:"TextBlock", text:$value, wrap:true} + (if $bold then {weight:"Bolder"} else {} end)]}]};
+            # header band carries the status: Open = orange, Merged = green, Closed = red
+            ({Open:{s:"warning", h:"🔀 NEW PR OPENED"},
+              Merged:{s:"good", h:"✅ PR MERGED"},
+              Closed:{s:"attention", h:"🔴 PR CLOSED"}}[$status]) as $st |
+            # flow payload: pr_key finds the existing Teams message so the same card is updated
+            {pr_key:($repo + "#" + $num), repo:$repo, status:$status,
+              card:{
+                "$schema":"http://adaptivecards.io/schemas/adaptive-card.json",
+                type:"AdaptiveCard", version:"1.4",
+                body:([
+                  # header band: colour comes from the container style only; text keeps the theme default (white/black)
+                  # status on the left, source -> target branch on the right, same row
+                  {type:"Container", style:$st.s, bleed:true, items:[{type:"ColumnSet", columns:[
+                    {type:"Column", width:"stretch", verticalContentAlignment:"Center", items:[
+                      {type:"TextBlock", text:($st.h + " #" + $num), weight:"Bolder", wrap:true}]},
+                    {type:"Column", width:"auto", verticalContentAlignment:"Center", items:[
+                      {type:"TextBlock", text:($head + " → " + $base), size:"Small", horizontalAlignment:"Right", wrap:true}]}
+                  ]}]},
+                  {type:"TextBlock", text:("📁 " + $project), size:"Small", weight:"Bolder", isSubtle:true, wrap:true, spacing:"Small"},
+                  {type:"TextBlock", text:$title, size:"Medium", weight:"Bolder", wrap:true, spacing:"None"},
+                  (row("👤 Raised by"; $who; true) + {spacing:"Small", separator:true})
+                ]
+                + (if ($tags|length) == 0 then [] else
+                    [row("🔍 Reviewer"; ($tags | map("<at>\(.name)</at>") | join(", ")); false)] end)),
+                actions:[{type:"Action.OpenUrl", title:"Open PR", url:$url, style:"positive"}],
+                msteams:{width:"Full", entities:(([$me] | map(select(. != null))) + $tags | unique_by(.email)
+                  | map({type:"mention", text:"<at>\(.name)</at>", mentioned:{id:.email, name:.name}}))}
+              }}')
+          curl -fsS --retry 3 -X POST -H 'Content-Type: application/json' -d "$payload" "$WEBHOOK"
