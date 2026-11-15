@@ -1,10 +1,11 @@
-import { useState } from 'react';
+import { useAtomValue } from 'jotai';
 import logo from './logo.svg';
 import './App.css';
+import { themeAtom } from './atoms';
+import ThemeToggle from './ThemeToggle';
 
 function App() {
-  const [theme, setTheme] = useState('dark');
-  const toggleTheme = () => setTheme((t) => (t === 'dark' ? 'light' : 'dark'));
+  const theme = useAtomValue(themeAtom);
 
   return (
     <div className={`App ${theme}`}>
@@ -13,9 +14,7 @@ function App() {
         <p>
           Current theme: <strong>{theme}</strong>
         </p>
-        <button className="App-toggle" onClick={toggleTheme}>
-          Switch to {theme === 'dark' ? 'light' : 'dark'} mode
-        </button>
+        <ThemeToggle />
         <a
           className="App-link"
           href="https://react.dev"
